@@ -1,0 +1,89 @@
+import express from 'express';
+import { createServer } from 'node:http';
+import { Server } from 'socket.io';
+import cors from 'cors';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { fresh, legal, move, next } from './engine.js';
+const app = express();
+app.use(cors());
+app.get('/health', (_, res) => { res.json({ ok: true }); });
+const clientDist = resolve(dirname(fileURLToPath(import.meta.url)), '../../client/dist');
+app.use(express.static(clientDist));
+app.use((req, res, next) => req.method === 'GET' ? res.sendFile(resolve(clientDist, 'index.html')) : next());
+const http = createServer(app);
+const io = new Server(http, { cors: { origin: process.env.CLIENT_URL || '*' } });
+const rooms = new Map();
+const code = () => Math.random().toString(36).slice(2, 8).toUpperCase();
+const emit = (g) => io.to(g.roomId).emit('state', g);
+const player = (g, id) => g.players.find(p => p.id === id);
+const color = (g, id) => { const p = player(g, id); if (!p)
+    throw Error('You are not in this room.'); return p.color; };
+io.on('connection', socket => {
+    socket.on('createRoom', (name, ack) => { let id = code(); while (rooms.has(id))
+        id = code(); const g = fresh(id); g.players.push({ id: socket.id, color: 'red', name: (name || 'Red player').slice(0, 24), ready: false, connected: true, rematch: false }); rooms.set(id, g); socket.join(id); ack({ ok: true, roomId: id, color: 'red', state: g }); });
+    socket.on('joinRoom', ({ roomId, name }, ack) => { const g = rooms.get(roomId?.toUpperCase()); if (!g)
+        return ack({ ok: false, error: 'Room not found.' }); const existing = player(g, socket.id); if (existing) {
+        existing.connected = true;
+        socket.join(g.roomId);
+        return ack({ ok: true, roomId: g.roomId, color: existing.color, state: g });
+    } if (g.players.length >= 2)
+        return ack({ ok: false, error: 'Room is full.' }); const p = { id: socket.id, color: 'yellow', name: (name || 'Yellow player').slice(0, 24), ready: false, connected: true, rematch: false }; g.players.push(p); socket.join(g.roomId); g.message = 'Opponent joined — both players ready up.'; ack({ ok: true, roomId: g.roomId, color: p.color, state: g }); emit(g); });
+    socket.on('ready', ({ roomId }, ack) => { try {
+        const g = rooms.get(roomId);
+        if (!g)
+            throw Error('Room not found.');
+        const p = player(g, socket.id);
+        if (!p)
+            throw Error('Not in room.');
+        p.ready = true;
+        if (g.players.length === 2 && g.players.every(x => x.ready)) {
+            g.status = 'playing';
+            g.message = 'Red starts. Roll the dice!';
+        }
+        emit(g);
+        ack({ ok: true });
+    }
+    catch (e) {
+        ack({ ok: false, error: e.message });
+    } });
+    socket.on('roll', ({ roomId }, ack) => { try {
+        const g = rooms.get(roomId);
+        if (!g || g.status !== 'playing' || g.dice !== null || color(g, socket.id) !== g.current)
+            throw Error('You cannot roll now.');
+        g.dice = Math.floor(Math.random() * 6) + 1;
+        const moves = legal(g, g.current);
+        g.message = moves.length ? 'Choose a highlighted token.' : 'No valid moves.';
+        emit(g);
+        ack({ ok: true });
+        if (!moves.length)
+            setTimeout(() => { if (g.dice !== null) {
+                g.dice = null;
+                next(g);
+                emit(g);
+            } }, 900);
+    }
+    catch (e) {
+        ack({ ok: false, error: e.message });
+    } });
+    socket.on('move', ({ roomId, tokenId }, ack) => { try {
+        const g = rooms.get(roomId);
+        if (!g)
+            throw Error('Room not found.');
+        move(g, color(g, socket.id), tokenId);
+        emit(g);
+        ack({ ok: true });
+    }
+    catch (e) {
+        ack({ ok: false, error: e.message });
+    } });
+    socket.on('disconnect', () => { for (const g of rooms.values()) {
+        const p = player(g, socket.id);
+        if (p) {
+            p.connected = false;
+            g.message = `${p.name} disconnected.`;
+            emit(g);
+        }
+    } });
+});
+http.listen(Number(process.env.PORT) || 3001, () => console.log('Ludo server on 3001'));
